@@ -4,11 +4,15 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/* ---------- Input Buffer ---------- */
+
 typedef struct {
   char* buffer;
   size_t buffer_length;
   ssize_t input_length;
 } InputBuffer;
+
+/* ---------- Enums ---------- */
 
 typedef enum { EXECUTE_SUCCESS, EXECUTE_TABLE_FULL } ExecuteResult;
 
@@ -19,25 +23,31 @@ typedef enum {
 
 typedef enum {
   PREPARE_SUCCESS,
+  PREPARE_NEGATIVE_ID,
+  PREPARE_STRING_TOO_LONG,
   PREPARE_SYNTAX_ERROR,
   PREPARE_UNRECOGNIZED_STATEMENT
 } PrepareResult;
 
 typedef enum { STATEMENT_INSERT, STATEMENT_SELECT } StatementType;
 
+/* ---------- Row Definition ---------- */
+
 #define COLUMN_USERNAME_SIZE 32
 #define COLUMN_EMAIL_SIZE 255
 
 typedef struct {
   uint32_t id;
-  char username[COLUMN_USERNAME_SIZE];
-  char email[COLUMN_EMAIL_SIZE];
+  char username[COLUMN_USERNAME_SIZE + 1]; // +1 for '\0'
+  char email[COLUMN_EMAIL_SIZE + 1];       // +1 for '\0'
 } Row;
 
 typedef struct {
   StatementType type;
   Row row_to_insert;
 } Statement;
+
+/* ---------- Row Layout ---------- */
 
 #define size_of_attribute(Struct, Attribute) sizeof(((Struct*)0)->Attribute)
 
@@ -49,6 +59,8 @@ const uint32_t ID_OFFSET = 0;
 const uint32_t USERNAME_OFFSET = ID_OFFSET + ID_SIZE;
 const uint32_t EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE;
 const uint32_t ROW_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
+
+/* ---------- Table Layout ---------- */
 
 const uint32_t PAGE_SIZE = 4096;
 #define TABLE_MAX_PAGES 100
@@ -98,19 +110,15 @@ void* row_slot(Table* table, uint32_t row_num) {
 Table* new_table() {
   Table* table = malloc(sizeof(Table));
   table->num_rows = 0;
-
   for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
     table->pages[i] = NULL;
   }
-
   return table;
 }
 
 void free_table(Table* table) {
   for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
-    if (table->pages[i]) {
-      free(table->pages[i]);
-    }
+    free(table->pages[i]);
   }
   free(table);
 }
@@ -143,22 +151,38 @@ MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
 
 /* ---------- Prepare ---------- */
 
+PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* statement) {
+  statement->type = STATEMENT_INSERT;
+
+  char* keyword = strtok(input_buffer->buffer, " ");
+  char* id_string = strtok(NULL, " ");
+  char* username = strtok(NULL, " ");
+  char* email = strtok(NULL, " ");
+
+  if (id_string == NULL || username == NULL || email == NULL) {
+    return PREPARE_SYNTAX_ERROR;
+  }
+
+  int id = atoi(id_string);
+  if (id < 0) {
+    return PREPARE_NEGATIVE_ID;
+  }
+
+  if (strlen(username) > COLUMN_USERNAME_SIZE ||
+      strlen(email) > COLUMN_EMAIL_SIZE) {
+    return PREPARE_STRING_TOO_LONG;
+  }
+
+  statement->row_to_insert.id = id;
+  strcpy(statement->row_to_insert.username, username);
+  strcpy(statement->row_to_insert.email, email);
+
+  return PREPARE_SUCCESS;
+}
+
 PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement) {
   if (strncmp(input_buffer->buffer, "insert", 6) == 0) {
-    statement->type = STATEMENT_INSERT;
-
-    int args_assigned = sscanf(
-      input_buffer->buffer,
-      "insert %d %s %s",
-      &(statement->row_to_insert.id),
-      statement->row_to_insert.username,
-      statement->row_to_insert.email
-    );
-
-    if (args_assigned < 3) {
-      return PREPARE_SYNTAX_ERROR;
-    }
-    return PREPARE_SUCCESS;
+    return prepare_insert(input_buffer, statement);
   }
 
   if (strcmp(input_buffer->buffer, "select") == 0) {
@@ -177,8 +201,7 @@ ExecuteResult execute_insert(Statement* statement, Table* table) {
   }
 
   serialize_row(&statement->row_to_insert, row_slot(table, table->num_rows));
-  table->num_rows += 1;
-
+  table->num_rows++;
   return EXECUTE_SUCCESS;
 }
 
@@ -201,22 +224,20 @@ ExecuteResult execute_statement(Statement* statement, Table* table) {
   return EXECUTE_SUCCESS;
 }
 
-void print_prompt() {
-  printf("db > ");
-}
+/* ---------- REPL ---------- */
+
+void print_prompt() { printf("db > "); }
 
 void read_input(InputBuffer* input_buffer) {
-  ssize_t bytes_read = getline(
-      &(input_buffer->buffer),
-      &(input_buffer->buffer_length),
-      stdin);
+  ssize_t bytes_read = getline(&(input_buffer->buffer),
+                               &(input_buffer->buffer_length),
+                               stdin);
 
   if (bytes_read <= 0) {
     printf("Error reading input\n");
     exit(EXIT_FAILURE);
   }
 
-  // Ignore newline
   input_buffer->input_length = bytes_read - 1;
   input_buffer->buffer[bytes_read - 1] = 0;
 }
@@ -245,11 +266,18 @@ int main(int argc, char* argv[]) {
     switch (prepare_statement(input_buffer, &statement)) {
       case PREPARE_SUCCESS:
         break;
+      case PREPARE_NEGATIVE_ID:
+        printf("ID must be positive.\n");
+        continue;
+      case PREPARE_STRING_TOO_LONG:
+        printf("String is too long.\n");
+        continue;
       case PREPARE_SYNTAX_ERROR:
         printf("Syntax error. Could not parse statement.\n");
         continue;
       case PREPARE_UNRECOGNIZED_STATEMENT:
-        printf("Unrecognized keyword at start of '%s'.\n", input_buffer->buffer);
+        printf("Unrecognized keyword at start of '%s'.\n",
+               input_buffer->buffer);
         continue;
     }
 
@@ -263,4 +291,3 @@ int main(int argc, char* argv[]) {
     }
   }
 }
-
