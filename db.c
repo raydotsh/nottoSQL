@@ -83,6 +83,14 @@ typedef struct {
   uint32_t num_rows;
 } Table;
 
+/* ================= CURSOR ================= */
+
+typedef struct {
+  Table* table;
+  uint32_t row_num;
+  bool end_of_table;
+} Cursor;
+
 /* ================= SERIALIZATION ================= */
 
 void serialize_row(Row* src, void* dest) {
@@ -119,27 +127,31 @@ Pager* pager_open(const char* filename) {
 }
 
 void* get_page(Pager* pager, uint32_t page_num) {
-  if (page_num > TABLE_MAX_PAGES) {
+  if (page_num >= TABLE_MAX_PAGES) {
     printf("Page out of bounds\n");
     exit(EXIT_FAILURE);
   }
 
   if (pager->pages[page_num] == NULL) {
     void* page = malloc(PAGE_SIZE);
+
     uint32_t num_pages = pager->file_length / PAGE_SIZE;
     if (pager->file_length % PAGE_SIZE) num_pages++;
 
-    if (page_num <= num_pages) {
+    if (page_num < num_pages) {
       lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
       read(pager->file_descriptor, page, PAGE_SIZE);
     }
 
     pager->pages[page_num] = page;
   }
+
   return pager->pages[page_num];
 }
 
 void pager_flush(Pager* pager, uint32_t page_num, uint32_t size) {
+  if (pager->pages[page_num] == NULL) return;
+
   lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
   write(pager->file_descriptor, pager->pages[page_num], size);
 }
@@ -154,13 +166,6 @@ Table* db_open(const char* filename) {
   table->pager = pager;
   table->num_rows = num_rows;
   return table;
-}
-
-void* row_slot(Table* table, uint32_t row_num) {
-  uint32_t page_num = row_num / ROWS_PER_PAGE;
-  void* page = get_page(table->pager, page_num);
-  uint32_t row_offset = row_num % ROWS_PER_PAGE;
-  return page + row_offset * ROW_SIZE;
 }
 
 void db_close(Table* table) {
@@ -181,6 +186,39 @@ void db_close(Table* table) {
   close(pager->file_descriptor);
   free(pager);
   free(table);
+}
+
+/* ================= CURSOR FUNCTIONS ================= */
+
+Cursor* table_start(Table* table) {
+  Cursor* cursor = malloc(sizeof(Cursor));
+  cursor->table = table;
+  cursor->row_num = 0;
+  cursor->end_of_table = (table->num_rows == 0);
+  return cursor;
+}
+
+Cursor* table_end(Table* table) {
+  Cursor* cursor = malloc(sizeof(Cursor));
+  cursor->table = table;
+  cursor->row_num = table->num_rows;
+  cursor->end_of_table = true;
+  return cursor;
+}
+
+void* cursor_value(Cursor* cursor) {
+  uint32_t row_num = cursor->row_num;
+  uint32_t page_num = row_num / ROWS_PER_PAGE;
+  void* page = get_page(cursor->table->pager, page_num);
+  uint32_t row_offset = row_num % ROWS_PER_PAGE;
+  uint32_t byte_offset = row_offset * ROW_SIZE;
+  return page + byte_offset;
+}
+
+void cursor_advance(Cursor* cursor) {
+  cursor->row_num++;
+  if (cursor->row_num >= cursor->table->num_rows)
+    cursor->end_of_table = true;
 }
 
 /* ================= STATEMENTS ================= */
@@ -225,21 +263,30 @@ PrepareResult prepare_statement(InputBuffer* ib, Statement* st) {
 /* ================= EXECUTE ================= */
 
 ExecuteResult execute_statement(Statement* st, Table* table) {
+
   if (st->type == STATEMENT_INSERT) {
     if (table->num_rows >= TABLE_MAX_ROWS)
       return EXECUTE_TABLE_FULL;
 
-    serialize_row(&st->row, row_slot(table, table->num_rows));
+    Cursor* cursor = table_end(table);
+    serialize_row(&st->row, cursor_value(cursor));
     table->num_rows++;
+    free(cursor);
+
     return EXECUTE_SUCCESS;
   }
 
   if (st->type == STATEMENT_SELECT) {
+    Cursor* cursor = table_start(table);
     Row row;
-    for (uint32_t i = 0; i < table->num_rows; i++) {
-      deserialize_row(row_slot(table, i), &row);
+
+    while (!cursor->end_of_table) {
+      deserialize_row(cursor_value(cursor), &row);
       printf("(%d, %s, %s)\n", row.id, row.username, row.email);
+      cursor_advance(cursor);
     }
+
+    free(cursor);
     return EXECUTE_SUCCESS;
   }
 
@@ -272,10 +319,9 @@ int main(int argc, char* argv[]) {
       continue;
     }
 
-    if (execute_statement(&st, table) == EXECUTE_TABLE_FULL) {
+    if (execute_statement(&st, table) == EXECUTE_TABLE_FULL)
       printf("Error: Table full.\n");
-    } else {
+    else
       printf("Executed.\n");
-    }
   }
 }
